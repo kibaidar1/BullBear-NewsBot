@@ -1,6 +1,12 @@
 """Управление базой данных"""
 import aiosqlite
 from typing import List, Optional
+from datetime import datetime
+from database.models import User, Subscription
+import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -21,12 +27,14 @@ class Database:
                 )
             ''')
 
-            # Таблица подписок
+            # Таблица подписок с колонками фильтров
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     company_name TEXT,
+                    exclude_keywords TEXT DEFAULT '[]',
+                    include_keywords TEXT DEFAULT '[]',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id),
                     UNIQUE(user_id, company_name)
@@ -44,21 +52,8 @@ class Database:
                 )
             ''')
 
-            # Таблица подписок с фильтрами
-            await db.execute('''
-                        CREATE TABLE IF NOT EXISTS subscriptions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER,
-                            company_name TEXT,
-                            exclude_keywords TEXT,  -- JSON список слов-исключений
-                            include_keywords TEXT,  -- JSON список обязательных слов
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users(user_id),
-                            UNIQUE(user_id, company_name)
-                        )
-                    ''')
-
             await db.commit()
+            logger.info("Database schema initialized")
 
     async def add_user(self, user_id: int, username: Optional[str] = None) -> bool:
         """Добавить пользователя"""
@@ -71,19 +66,17 @@ class Database:
                 await db.commit()
                 return True
             except Exception as e:
-                print(f"Error adding user: {e}")
+                logger.error(f"Error adding user: {e}")
                 return False
 
     async def add_subscription(
-            self,
-            user_id: int,
-            company_name: str,
-            exclude_keywords: list = None,
-            include_keywords: list = None
+        self,
+        user_id: int,
+        company_name: str,
+        exclude_keywords: list = None,
+        include_keywords: list = None
     ) -> bool:
         """Добавить подписку с фильтрами"""
-        import json
-
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 await db.execute(
@@ -101,6 +94,9 @@ class Database:
                 return True
             except aiosqlite.IntegrityError:
                 return False
+            except Exception as e:
+                logger.error(f"Error adding subscription: {e}")
+                return False
 
     async def remove_subscription(self, user_id: int, company_name: str) -> bool:
         """Удалить подписку"""
@@ -116,8 +112,8 @@ class Database:
         """Получить подписки пользователя"""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                    'SELECT company_name FROM subscriptions WHERE user_id = ? ORDER BY created_at',
-                    (user_id,)
+                'SELECT company_name FROM subscriptions WHERE user_id = ? ORDER BY created_at',
+                (user_id,)
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
@@ -126,60 +122,16 @@ class Database:
         """Получить все подписки"""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                    'SELECT user_id, company_name FROM subscriptions'
+                'SELECT user_id, company_name FROM subscriptions'
             ) as cursor:
                 return await cursor.fetchall()
-
-    async def get_subscription_filters(self, user_id: int, company_name: str) -> dict:
-        """Получить фильтры для подписки"""
-        import json
-
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                    '''SELECT exclude_keywords, include_keywords 
-                       FROM subscriptions 
-                       WHERE user_id = ? AND company_name = ?''',
-                    (user_id, company_name)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return {
-                        'exclude': json.loads(row[0]) if row[0] else [],
-                        'include': json.loads(row[1]) if row[1] else []
-                    }
-                return {'exclude': [], 'include': []}
-
-    async def update_subscription_filters(
-            self,
-            user_id: int,
-            company_name: str,
-            exclude_keywords: list = None,
-            include_keywords: list = None
-    ) -> bool:
-        """Обновить фильтры подписки"""
-        import json
-
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                '''UPDATE subscriptions 
-                   SET exclude_keywords = ?, include_keywords = ?
-                   WHERE user_id = ? AND company_name = ?''',
-                (
-                    json.dumps(exclude_keywords or [], ensure_ascii=False),
-                    json.dumps(include_keywords or [], ensure_ascii=False),
-                    user_id,
-                    company_name
-                )
-            )
-            await db.commit()
-            return cursor.rowcount > 0
 
     async def is_news_sent(self, user_id: int, news_url: str) -> bool:
         """Проверить, была ли отправлена новость"""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                    'SELECT 1 FROM sent_news WHERE user_id = ? AND news_url = ?',
-                    (user_id, news_url)
+                'SELECT 1 FROM sent_news WHERE user_id = ? AND news_url = ?',
+                (user_id, news_url)
             ) as cursor:
                 result = await cursor.fetchone()
                 return result is not None
@@ -197,6 +149,54 @@ class Database:
             except aiosqlite.IntegrityError:
                 return False
 
+    async def get_subscription_filters(self, user_id: int, company_name: str) -> dict:
+        """Получить фильтры для подписки"""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                '''SELECT exclude_keywords, include_keywords 
+                   FROM subscriptions 
+                   WHERE user_id = ? AND company_name = ?''',
+                (user_id, company_name)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    try:
+                        return {
+                            'exclude': json.loads(row[0]) if row[0] else [],
+                            'include': json.loads(row[1]) if row[1] else []
+                        }
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON in filters for {company_name}")
+                        return {'exclude': [], 'include': []}
+                return {'exclude': [], 'include': []}
+
+    async def update_subscription_filters(
+        self,
+        user_id: int,
+        company_name: str,
+        exclude_keywords: list = None,
+        include_keywords: list = None
+    ) -> bool:
+        """Обновить фильтры подписки"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                cursor = await db.execute(
+                    '''UPDATE subscriptions 
+                       SET exclude_keywords = ?, include_keywords = ?
+                       WHERE user_id = ? AND company_name = ?''',
+                    (
+                        json.dumps(exclude_keywords or [], ensure_ascii=False),
+                        json.dumps(include_keywords or [], ensure_ascii=False),
+                        user_id,
+                        company_name
+                    )
+                )
+                await db.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"Error updating filters: {e}")
+                return False
+
     async def cleanup_old_news(self, days: int = 7):
         """Удалить старые записи об отправленных новостях"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -205,3 +205,4 @@ class Database:
                 (days,)
             )
             await db.commit()
+            logger.info(f"Cleaned up news older than {days} days")
