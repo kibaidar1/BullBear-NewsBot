@@ -4,8 +4,8 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from bot.database.database import Database
-from bot.services.news_filter import NewsFilter
+from database.database import Database
+from services.news_filter import NewsFilter
 from bot.keyboards.inline import get_main_menu_keyboard, get_back_button
 
 router = Router()
